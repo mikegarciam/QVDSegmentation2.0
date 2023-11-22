@@ -1,0 +1,513 @@
+/*******************             QVD Segmentation 2.0           ********************
+
+The MIT License (MIT)
+
+Copyright (c) 2018-2019 Miguel Ángel García - All Rights Reserved
+
+This script is part of the Lean Data Processing Framework code bundle.
+
+************************         www.aftersync.com         *************************
+********************         www.leandataprocessing.com         ********************
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+********************			********************			*******************/
+
+/* SUB StoreSegmentedQVDs
+This subroutine will store a source table into segmented QVDs, while also allowing for incremental loads.
+
+Parameters:
+	vSegmentedQVDs_Directory				= Directory containing QVDs
+	vSegmentedQVDs_SourceTableName			= Name of the table that will be stored
+	vSegmentedQVDs_TimeField				= Name of the field in [vSegmentedQVDs_SourceTableName] that contains 
+										  	  the time value on which the table will be partioned
+	vSegmentedQVDs_PartitionPeriod			= How the table will be partioned. Example: 'Year', 'Month', 'Day'.
+										  	  Default is 'Month' (YYYYMM).
+	vSegmentedQVDs_KeyField					= Name of the field in [vSegmentedQVDs_SourceTableName] that contains
+										  	  the key on which the delta will be applied (used in "Not Exists(Key)" when 
+										  	  merging new data with historical QVDs.
+	vSegmentedQVDs_FullLoad					= (Optional) - Flag to identify when a full load is being done. 
+										  	  Possiblevalues = 1 or 0.
+										  	  Default is 1
+	vSegmentedQVDs_DropFieldsBeforeStore 	= (Optional) - When a temproray field is used in conjuction with (vSegmentedQVDs_AlernativeExistsField)
+										  	  to merge new data with historical QVDs when no primary key exists.
+										  	  Example: if the key is to be "Date", the script will now "Where Not exists(DateTemp, Date)"
+										  	  And drop DateTemp before Storing the merged QVD.
+										  	  This needs to be enclosed in [] if necessary, and also allows multiple fields.
+	vSegmentedQVDs_AlernativeExistsField 	= (Optional) - Basically the same as the previous one, but separated to allow more flexibiltiy
+										  	  e.g. to use more fields in one or the other.
+										  	  This one should not be enclosed in [].
+	vSegmentedQVDs_PhasedPrePartitionPeriods = (Optional) - This parameter indicates when the segmentation loop should be done in phases
+											  to make it more efficient. E.g. If the segmentation is by Month, there can be a pre-partition 
+											  by Year, then loop through for each month in one year, instead of looping the entire table 
+											  for each month. This also reduces the table size continuously on each loop after a portion
+											  of the data is stored, so that subsequent loops deal with less and less data.
+										  	  You can enable this functionality by simply passing 'Yes' when calling the function, in which
+											  case there will be no pre-partioning, just auto-purging on each loop.
+											  To enable pre-partiniong, pass the name of the period on which the pre-partioning should be
+											  based. E.g. 'Year', or 'Month'. You can also pass multiple period names to enable multiple,
+											  recursive pre-partitions by separating them by a comma. E.g. 'Year,Month'.
+											  The pre-partition period should be of greated range than vSegmentedQVDs_PartitionPeriod.
+											  E.g.: if vSegmentedQVDs_PartitionPeriod = 'Month', then vSegmentedQVDs_PhasedPrePartitionPeriods
+											  can be 'Year'. Or if if vSegmentedQVDs_PartitionPeriod = 'Day', then vSegmentedQVDs_PhasedPrePartitionPeriods
+											  can be 'Year', 'Month' or 'Year,Month'.
+	vSegmentedQVDs_PrePartition_VolumeBased = (Optional) - This enables the partioning loop(s) to complete the periods/partitions with the
+											  highest volume first, thereby optimizing the entire operation. To enable, simply pass 'Yes' 
+											  on this parameter when calling the function.
+	vSegmentedQVDs_DirectoryPattern 		= (Optional) - This parameter allows the use of a subdirectory structure for each time period.
+											  For example, if the QVDs being produced are segmented by month, then you can store each year in
+											  a separate subdirectory by passing 'YYYY' on this parameter when calling the function.
+											  Or if the QVDs are by Day, you can create a 2-directory structure by passing: 'YYYY\MM', which 
+											  would result in one folder being created for each year, and one folder within each Year for each 
+											  Month.
+											  *** This feature requires QlikView / Qlik Sense November 2018 or greater and does not work on QSE on Kubernetes or Qlik Core.
+	
+Usage:
+	CALL StoreSegmentedQVDs('Directory\Path', 'MyTable', 'DateField', 'Month', 'MyKey', '$(vCustomFullLoadVariable)', 'KeyTemp, [Other Field]', 'KeyTemp', 'Year', 'Yes', 'YYYY\MM');
+
+Optional fields may be ommitted from the CALL. Example: 
+	CALL StoreSegmentedQVDs('Directory\Path', 'MyTable', 'DateField', 'Month');
+OR:
+	CALL StoreSegmentedQVDs('Directory\Path', 'MyTable', 'DateField', 'Month', '', '', 'KeyTemp', '', 'Yes');
+
+*/
+
+SUB StoreSegmentedQVDs(vSegmentedQVDs_Directory, vSegmentedQVDs_SourceTableName, vSegmentedQVDs_TimeField, vSegmentedQVDs_PartitionPeriod, vSegmentedQVDs_KeyField, vSegmentedQVDs_FullLoad, vSegmentedQVDs_DropFieldsBeforeStore, vSegmentedQVDs_AlernativeExistsField, vSegmentedQVDs_PhasedPrePartitionPeriods, vSegmentedQVDs_PrePartition_VolumeBased, vSegmentedQVDs_DirectoryPattern);
+
+	IF RangeMax(0, NoOfRows('$(vSegmentedQVDs_SourceTableName)')) = 0 THEN
+		Trace No New Rows to Store;
+		DROP TABLE [$(vSegmentedQVDs_SourceTableName)];
+		EXIT SUB;
+	ENDIF;
+
+	SegmentedQVDsPeriods:
+		LOAD * INLINE [
+			SegmentedQVDsPeriodOrder, SegmentedQVDsPeriodName, SegmentedQVDsPeriodFormat
+			1, Year	, YYYY
+			2, Month, YYYYMM
+			3, Day	, YYYYMMDD
+			4, Hour	, YYYYMMDDhh
+		];
+
+	Map_SegmentedQVDsPeriods_Formats:
+		Mapping Load 
+			SegmentedQVDsPeriodName,
+			SegmentedQVDsPeriodFormat
+		Resident SegmentedQVDsPeriods;
+	
+	Map_SegmentedQVDsPeriods_Orders:
+		Mapping Load 
+			SegmentedQVDsPeriodName,
+			SegmentedQVDsPeriodOrder
+		Resident SegmentedQVDsPeriods;
+	
+	Drop Table SegmentedQVDsPeriods;
+	Let vSegmentedQVDs_PartitionFormat = ApplyMap('Map_SegmentedQVDsPeriods_Formats', '$(vSegmentedQVDs_PartitionPeriod)', 'YYYYMM');
+	
+	/*
+		SWITCH '$(vSegmentedQVDs_PartitionPeriod)' 
+			CASE 'Month'
+				Set vSegmentedQVDs_PartitionFormat = 'YYYYMM';
+			Case 'Year'
+				Set vSegmentedQVDs_PartitionFormat = 'YYYY';
+			Case 'Day'
+				Set vSegmentedQVDs_PartitionFormat = 'YYYYMMDD';
+			Default 
+				Set vSegmentedQVDs_PartitionFormat = 'YYYYMM';
+		END SWITCH
+	*/
+
+	IF (LEN('$(vSegmentedQVDs_PhasedPrePartitionPeriods)')) > 0 THEN 
+
+		SegmentedQVDsPhasedPrePartitions_Temp:
+			LOAD *,
+				 ApplyMap('Map_SegmentedQVDsPeriods_Formats', 
+				 	 	  SegmentedQVDsPhasedPrePartitionPeriod,
+						  'YYYYMM') as SegmentedQVDsPhasedPrePartitionPeriod_Format,
+				ApplyMap('Map_SegmentedQVDsPeriods_Orders', 
+				 	 	  	  SegmentedQVDsPhasedPrePartitionPeriod, 10) as SegmentedQVDsPhasedPrePartitionPeriod_Order
+			WHERE 
+				//LOWER(SegmentedQVDsPhasedPrePartitionPeriod) <> LOWER('$(vSegmentedQVDs_PartitionPeriod)')
+				//AND the Pre-partition period is of a higher hierarchy than the final partition period
+				//AND 
+				ApplyMap('Map_SegmentedQVDsPeriods_Orders', 
+				 	 	  	  SegmentedQVDsPhasedPrePartitionPeriod, 10) 
+					<= ApplyMap('Map_SegmentedQVDsPeriods_Orders', 
+				 	 	'$(vSegmentedQVDs_PartitionPeriod)', 10);
+			LOAD Distinct
+				SubField('$(vSegmentedQVDs_PhasedPrePartitionPeriods),$(vSegmentedQVDs_PartitionPeriod)', ',') as SegmentedQVDsPhasedPrePartitionPeriod
+			AutoGenerate 1;
+
+		SegmentedQVDsPhasedPrePartitions:
+			NoConcatenate
+				LOAD * Resident SegmentedQVDsPhasedPrePartitions_Temp
+				Order By SegmentedQVDsPhasedPrePartitionPeriod_Order asc;
+
+		Drop Table SegmentedQVDsPhasedPrePartitions_Temp;
+
+	ENDIF 
+
+	IF LEN('$(vSegmentedQVDs_PrePartition_VolumeBased)') > 0  THEN 
+		
+		[$(vSegmentedQVDs_SourceTableName)Temp]:
+			NoConcatenate
+				Load
+					[$(vSegmentedQVDs_TimeField)],
+					Text(Date([$(vSegmentedQVDs_TimeField)],'$(vSegmentedQVDs_PartitionFormat)')) as SegmentedQVDPartitionKey,
+					COUNT([$(vSegmentedQVDs_TimeField)]) as SegmentedQVDsTotalVolume
+				Resident [$(vSegmentedQVDs_SourceTableName)]
+					GROUP BY [$(vSegmentedQVDs_TimeField)],
+							 Text(Date([$(vSegmentedQVDs_TimeField)],'$(vSegmentedQVDs_PartitionFormat)'))
+					;
+	
+	ELSE 
+
+		[$(vSegmentedQVDs_SourceTableName)Temp]:
+			NoConcatenate
+				Load Distinct
+					[$(vSegmentedQVDs_TimeField)],
+					Text(Date([$(vSegmentedQVDs_TimeField)],'$(vSegmentedQVDs_PartitionFormat)')) as SegmentedQVDPartitionKey
+				Resident [$(vSegmentedQVDs_SourceTableName)];
+	
+	ENDIF 
+
+	IF (LEN('$(vSegmentedQVDs_PhasedPrePartitionPeriods)')) > 0 and RangeMax(0, NoOfRows('SegmentedQVDsPhasedPrePartitions')) > 0 THEN 
+
+		CALL SegmentedQVDs_AddPrePartitionFields('$(vSegmentedQVDs_SourceTableName)Temp');
+
+	ENDIF 
+
+	Left Join ([$(vSegmentedQVDs_SourceTableName)])
+		Load
+			*
+		Resident [$(vSegmentedQVDs_SourceTableName)Temp];
+	
+	IF LEN('$(vSegmentedQVDs_PrePartition_VolumeBased)') > 0 THEN 
+		
+		DROP FIELD SegmentedQVDsTotalVolume FROM [$(vSegmentedQVDs_SourceTableName)];
+		
+		SegmentedQVDPartitionKeys:
+			NoConcatenate 
+			LOAD
+				SegmentedQVDPartitionKey,
+				Sum(SegmentedQVDsTotalVolume) as SegmentedQVDsTotalVolume
+			Resident [$(vSegmentedQVDs_SourceTableName)Temp]
+			Group by SegmentedQVDPartitionKey;
+		
+		
+		IF NOT (LEN('$(vSegmentedQVDs_PhasedPrePartitionPeriods)') > 0 AND RangeMax(0, NoOfRows('SegmentedQVDsPhasedPrePartitions')) > 0)  THEN 	
+			
+			RENAME TABLE SegmentedQVDPartitionKeys TO SegmentedQVDPartitionKeys_Temp;
+			
+			SegmentedQVDPartitionKeys:
+				NoConcatenate LOAD * Resident SegmentedQVDPartitionKeys_Temp 
+				Order by SegmentedQVDsTotalVolume desc; 
+			
+			DROP TABLE SegmentedQVDPartitionKeys_Temp;
+			
+		ENDIF 
+		
+	ELSE 
+		
+		SegmentedQVDPartitionKeys:
+			NoConcatenate 
+			LOAD Distinct
+				SegmentedQVDPartitionKey
+			Resident [$(vSegmentedQVDs_SourceTableName)Temp]
+			Order By SegmentedQVDPartitionKey asc;
+
+	ENDIF 
+	
+	IF LEN('$(vSegmentedQVDs_PhasedPrePartitionPeriods)') > 0 AND RangeMax(0, NoOfRows('SegmentedQVDsPhasedPrePartitions')) > 0  THEN 
+	
+		CALL SegmentedQVDs_AddPrePartitionFields('SegmentedQVDPartitionKeys');
+	
+	ENDIF 	
+	
+	/*
+	IF LEN('$(vSegmentedQVDs_PhasedPrePartitionPeriods)') > 0 AND RangeMax(0, NoOfRows('SegmentedQVDsPhasedPrePartitions')) > 0  THEN 
+		
+		IF LEN('$(vSegmentedQVDs_PrePartition_VolumeBased)') > 0 THEN 
+			DROP FIELD SegmentedQVDsTotalVolume FROM [$(vSegmentedQVDs_SourceTableName)];
+			
+			SegmentedQVDPartitionKeys_Temp:
+				NoConcatenate 
+				LOAD
+					SegmentedQVDPartitionKey,
+					Sum(SegmentedQVDsTotalVolume) as SegmentedQVDsTotalVolume
+				Resident [$(vSegmentedQVDs_SourceTableName)Temp]
+				Group by SegmentedQVDPartitionKey;
+			
+			CALL SegmentedQVDs_AddPrePartitionFields('SegmentedQVDPartitionKeys');
+		
+		ELSE 
+		
+			SegmentedQVDPartitionKeys:
+				NoConcatenate 
+				LOAD Distinct
+					SegmentedQVDPartitionKey
+				Resident [$(vSegmentedQVDs_SourceTableName)Temp];
+
+			CALL SegmentedQVDs_AddPrePartitionFields('SegmentedQVDPartitionKeys');
+			
+		ENDIF 
+		
+	ELSE 
+
+		SegmentedQVDPartitionKeys:
+			NoConcatenate 
+			LOAD Distinct
+				SegmentedQVDPartitionKey
+			Resident [$(vSegmentedQVDs_SourceTableName)Temp]
+			Order By SegmentedQVDPartitionKey asc;
+
+	ENDIF 
+	*/
+	Drop Table [$(vSegmentedQVDs_SourceTableName)Temp];
+	
+	If (LEN('$(vSegmentedQVDs_PhasedPrePartitionPeriods)')) > 0 and RangeMax(0, NoOfRows('SegmentedQVDsPhasedPrePartitions')) > 0 THEN 
+		
+		DROP FIELD SegmentedQVDPartitionKey from [$(vSegmentedQVDs_SourceTableName)];
+		
+		CALL SegmentedQVDs_DoPartition ('0');
+
+	ELSE
+
+		CALL SegmentedQVDs_DoPartition ('');
+
+	ENDIF 
+	
+	DROP TABLE SegmentedQVDPartitionKeys;
+	
+	IF RangeMax(0, NoOfRows('SegmentedQVDsPhasedPrePartitions')) > 0 THEN 
+		DROP TABLE SegmentedQVDsPhasedPrePartitions;
+	ENDIF 
+	
+	Let vSegmentedQVDs_PartitionFormat = ;
+
+	// Resetting all input variables.
+	Let vSegmentedQVDs_Directory = ;
+	Let vSegmentedQVDs_SourceTableName = ;
+	Let vSegmentedQVDs_TimeField = ;
+	Let vSegmentedQVDs_PartitionPeriod = ;
+	Let vSegmentedQVDs_KeyField = ;
+	Let vSegmentedQVDs_FullLoad = ;
+	Let vSegmentedQVDs_DropFieldsBeforeStore = ;
+	Let vSegmentedQVDs_AlernativeExistsField = ;
+	Let vSegmentedQVDs_PhasedPrePartitionPeriods =;
+	Let vSegmentedQVDs_PrePartition_VolumeBased =;
+	Let vSegmentedQVDs_DoPartition_Phase_Previous = ;
+	Let vSegmentedQVDs_DoPartition_Phase_Next = ;
+
+END SUB;
+
+SUB SegmentedQVDs_DoPartition(vSegmentedQVDs_DoPartition_Phase, vSegmentedQVDs_DoPartition_Phase_Previous_Key)
+
+	If LEN('$(vSegmentedQVDs_DoPartition_Phase)') > 0 THEN
+			
+		Let vSegmentedQVDs_DoPartition_Phase_Previous = If($(vSegmentedQVDs_DoPartition_Phase) > 0, $(vSegmentedQVDs_DoPartition_Phase) - 1, 0);
+		Let vSegmentedQVDs_DoPartition_Phase_Next = If($(vSegmentedQVDs_DoPartition_Phase) < (NoOfRows('SegmentedQVDsPhasedPrePartitions') - 1), $(vSegmentedQVDs_DoPartition_Phase) + 1, 0);
+		Let vSegmentedQVDs_SourceTableName_Phase_$(vSegmentedQVDs_DoPartition_Phase) = If($(vSegmentedQVDs_DoPartition_Phase)=0,'$(vSegmentedQVDs_SourceTableName)','$(vSegmentedQVDs_SourceTableName_Phase_$(vSegmentedQVDs_DoPartition_Phase_Previous))_$(vPartitionKey_Phase_$(vSegmentedQVDs_DoPartition_Phase_Previous))');
+			
+		IF LEN('$(vSegmentedQVDs_PrePartition_VolumeBased)') > 0 THEN
+			If($(vSegmentedQVDs_DoPartition_Phase) > 0) THEN 
+				[SegmentedQVDs_VolumeTotals_$(vSegmentedQVDs_DoPartition_Phase)_Temp]:
+					LOAD 
+						[SegmentedQVDPartitionKey_PrePartition_$(vSegmentedQVDs_DoPartition_Phase)],
+						Sum(SegmentedQVDsTotalVolume) as SegmentedQVDsTotalVolume_$(vSegmentedQVDs_DoPartition_Phase)
+					Resident SegmentedQVDPartitionKeys
+						WHERE [SegmentedQVDPartitionKey_PrePartition_$(vSegmentedQVDs_DoPartition_Phase_Previous)] = '$(vSegmentedQVDs_DoPartition_Phase_Previous_Key)'
+						Group By [SegmentedQVDPartitionKey_PrePartition_$(vSegmentedQVDs_DoPartition_Phase)];
+			ELSE 
+				[SegmentedQVDs_VolumeTotals_$(vSegmentedQVDs_DoPartition_Phase)_Temp]:
+					LOAD 
+						[SegmentedQVDPartitionKey_PrePartition_$(vSegmentedQVDs_DoPartition_Phase)],
+						Sum(SegmentedQVDsTotalVolume) as SegmentedQVDsTotalVolume_$(vSegmentedQVDs_DoPartition_Phase)
+					Resident SegmentedQVDPartitionKeys
+						Group By [SegmentedQVDPartitionKey_PrePartition_$(vSegmentedQVDs_DoPartition_Phase)];
+			ENDIF 
+		
+			[SegmentedQVDPartitionKeys_Phase_$(vSegmentedQVDs_DoPartition_Phase)]:
+				NoConcatenate
+				Load Distinct [SegmentedQVDPartitionKey_PrePartition_$(vSegmentedQVDs_DoPartition_Phase)]
+				Resident 
+				[SegmentedQVDs_VolumeTotals_$(vSegmentedQVDs_DoPartition_Phase)_Temp]
+				Order By [SegmentedQVDsTotalVolume_$(vSegmentedQVDs_DoPartition_Phase)] desc;
+
+			Drop Table [SegmentedQVDs_VolumeTotals_$(vSegmentedQVDs_DoPartition_Phase)_Temp];
+			
+		ELSE 
+			If($(vSegmentedQVDs_DoPartition_Phase) > 0) THEN 
+				[SegmentedQVDPartitionKeys_Phase_$(vSegmentedQVDs_DoPartition_Phase)]:
+					NoConcatenate
+					Load Distinct [SegmentedQVDPartitionKey_PrePartition_$(vSegmentedQVDs_DoPartition_Phase)]
+					Resident SegmentedQVDPartitionKeys
+					WHERE [SegmentedQVDPartitionKey_PrePartition_$(vSegmentedQVDs_DoPartition_Phase_Previous)] = '$(vSegmentedQVDs_DoPartition_Phase_Previous_Key)';
+			ELSE 
+				[SegmentedQVDPartitionKeys_Phase_$(vSegmentedQVDs_DoPartition_Phase)]:
+					NoConcatenate
+					Load Distinct [SegmentedQVDPartitionKey_PrePartition_$(vSegmentedQVDs_DoPartition_Phase)]
+					Resident SegmentedQVDPartitionKeys;
+			ENDIF 	
+		ENDIF 
+		
+		[SegmentedQVDPartitionKeys_Phase_$(vSegmentedQVDs_DoPartition_Phase)_Remaining]:
+			NoConcatenate LOAD * Resident [SegmentedQVDPartitionKeys_Phase_$(vSegmentedQVDs_DoPartition_Phase)];
+
+		For vLoop_PartitionKeys_Phase_$(vSegmentedQVDs_DoPartition_Phase) = 0 To NoOfRows('SegmentedQVDPartitionKeys_Phase_$(vSegmentedQVDs_DoPartition_Phase)') - 1
+
+			Let vPartitionKey_Phase_$(vSegmentedQVDs_DoPartition_Phase) = Peek('SegmentedQVDPartitionKey_PrePartition_$(vSegmentedQVDs_DoPartition_Phase)', $(vLoop_PartitionKeys_Phase_$(vSegmentedQVDs_DoPartition_Phase)), 'SegmentedQVDPartitionKeys_Phase_$(vSegmentedQVDs_DoPartition_Phase)');
+			
+			If  NoOfRows('SegmentedQVDPartitionKeys_Phase_$(vSegmentedQVDs_DoPartition_Phase)_Remaining') = 1 THEN 
+				RENAME TABLE [$(vSegmentedQVDs_SourceTableName_Phase_$(vSegmentedQVDs_DoPartition_Phase))] TO [$(vSegmentedQVDs_SourceTableName_Phase_$(vSegmentedQVDs_DoPartition_Phase))_$(vPartitionKey_Phase_$(vSegmentedQVDs_DoPartition_Phase))];
+			ELSE 
+
+				[$(vSegmentedQVDs_SourceTableName_Phase_$(vSegmentedQVDs_DoPartition_Phase))_$(vPartitionKey_Phase_$(vSegmentedQVDs_DoPartition_Phase))]:
+					NoConcatenate 
+					LOAD * Resident 
+					[$(vSegmentedQVDs_SourceTableName_Phase_$(vSegmentedQVDs_DoPartition_Phase))]
+					WHERE [SegmentedQVDPartitionKey_PrePartition_$(vSegmentedQVDs_DoPartition_Phase)] = '$(vPartitionKey_Phase_$(vSegmentedQVDs_DoPartition_Phase))';
+
+			ENDIF 
+
+			DROP FIELD [SegmentedQVDPartitionKey_PrePartition_$(vSegmentedQVDs_DoPartition_Phase)] FROM [$(vSegmentedQVDs_SourceTableName_Phase_$(vSegmentedQVDs_DoPartition_Phase))_$(vPartitionKey_Phase_$(vSegmentedQVDs_DoPartition_Phase))];
+			
+			Inner Join ([SegmentedQVDPartitionKeys_Phase_$(vSegmentedQVDs_DoPartition_Phase)_Remaining])
+				LOAD * Resident [SegmentedQVDPartitionKeys_Phase_$(vSegmentedQVDs_DoPartition_Phase)_Remaining] 
+				WHERE [SegmentedQVDPartitionKey_PrePartition_$(vSegmentedQVDs_DoPartition_Phase)] <> '$(vPartitionKey_Phase_$(vSegmentedQVDs_DoPartition_Phase))';
+
+
+			IF NoOfRows('SegmentedQVDPartitionKeys_Phase_$(vSegmentedQVDs_DoPartition_Phase)_Remaining') > 0 THEN 
+			
+				Inner Join ([$(vSegmentedQVDs_SourceTableName_Phase_$(vSegmentedQVDs_DoPartition_Phase))])
+					LOAD [SegmentedQVDPartitionKey_PrePartition_$(vSegmentedQVDs_DoPartition_Phase)]
+					Resident [SegmentedQVDPartitionKeys_Phase_$(vSegmentedQVDs_DoPartition_Phase)_Remaining];	
+			
+			ENDIF 
+
+			IF (RangeMax(0, $(vSegmentedQVDs_DoPartition_Phase_Next))>0) THEN 
+
+				CALL SegmentedQVDs_DoPartition('$(vSegmentedQVDs_DoPartition_Phase_Next)', '$(vPartitionKey_Phase_$(vSegmentedQVDs_DoPartition_Phase))');
+
+			ELSE 
+
+				CALL SegmentedQVDs_DoStore('$(vSegmentedQVDs_SourceTableName_Phase_$(vSegmentedQVDs_DoPartition_Phase))_$(vPartitionKey_Phase_$(vSegmentedQVDs_DoPartition_Phase))', '$(vPartitionKey_Phase_$(vSegmentedQVDs_DoPartition_Phase))');
+
+			ENDIF 
+
+			Let vPartitionKey_Phase_$(vSegmentedQVDs_DoPartition_Phase) = ;
+		
+		Next vLoop_PartitionKeys_Phase_$(vSegmentedQVDs_DoPartition_Phase)
+		
+		Drop Table [SegmentedQVDPartitionKeys_Phase_$(vSegmentedQVDs_DoPartition_Phase)_Remaining];
+		Drop Table [SegmentedQVDPartitionKeys_Phase_$(vSegmentedQVDs_DoPartition_Phase)];
+		
+		Let vLoop_PartitionKeys_Phase_$(vSegmentedQVDs_DoPartition_Phase) = ;
+
+		Let vSegmentedQVDs_SourceTableName_Phase_$(vSegmentedQVDs_DoPartition_Phase) = ;
+		Let vSegmentedQVDs_DoPartition_Phase = If($(vSegmentedQVDs_DoPartition_Phase) > 0, $(vSegmentedQVDs_DoPartition_Phase) - 1, 0);
+		Let vSegmentedQVDs_DoPartition_Phase_Previous = If($(vSegmentedQVDs_DoPartition_Phase) > 0, $(vSegmentedQVDs_DoPartition_Phase) - 1, 0);
+		Let vSegmentedQVDs_DoPartition_Phase_Next = If($(vSegmentedQVDs_DoPartition_Phase) < (NoOfRows('SegmentedQVDsPhasedPrePartitions') - 1), $(vSegmentedQVDs_DoPartition_Phase) + 1, 0);
+
+	ELSE 
+
+		FOR vSegmentedQVDs_Loop_Keys = 0 to NoOfRows('SegmentedQVDPartitionKeys') - 1
+
+			Let vSegmentedQVDs_Loop_PartitionKey = Peek('SegmentedQVDPartitionKey',$(vSegmentedQVDs_Loop_Keys),'SegmentedQVDPartitionKeys');
+			
+			[$(vSegmentedQVDs_Loop_PartitionKey)]:
+				NoConcatenate
+				LOAD *
+				Resident [$(vSegmentedQVDs_SourceTableName)]
+				Where SegmentedQVDPartitionKey = '$(vSegmentedQVDs_Loop_PartitionKey)';
+			
+			DROP FIELD SegmentedQVDPartitionKey from [$(vSegmentedQVDs_Loop_PartitionKey)];
+			
+			CALL SegmentedQVDs_DoStore('$(vSegmentedQVDs_Loop_PartitionKey)', '$(vSegmentedQVDs_Loop_PartitionKey)');
+
+			Let vSegmentedQVDs_Loop_PartitionKey =;
+			
+		NEXT vSegmentedQVDs_Loop_Keys
+
+		Drop Table [$(vSegmentedQVDs_SourceTableName)];
+		
+	ENDIF  
+	
+
+	// Resetting all temporary variables.
+	Let vSegmentedQVDs_Loop_Keys = ;
+	Let vSegmentedQVDs_ExistsParameters = ;
+
+END SUB 
+
+Sub SegmentedQVDs_DoStore (vSegmentedQVDs_DoStore_TableName, vSegmentedQVDs_DoStore_PartitionKey)
+
+	If LEN('$(vSegmentedQVDs_DirectoryPattern)') > 0 THEN 
+	
+		Let vSegmentedQVDs_DirectoryPath = ;
+		For vSegmentedQVDs_DoStore_Loop_DirectoryPattern = 1 to SubstringCount('$(vSegmentedQVDs_DirectoryPattern)', '\') + 1
+			
+			Let vSegmentedQVDs_DirectoryPath = '$(vSegmentedQVDs_DirectoryPath)\' & Text(Date(Date#('$(vSegmentedQVDs_DoStore_PartitionKey)', '$(vSegmentedQVDs_PartitionFormat)'), SubField('$(vSegmentedQVDs_DirectoryPattern)', '\', $(vSegmentedQVDs_DoStore_Loop_DirectoryPattern))));
+			
+		Next vSegmentedQVDs_DoStore_Loop_DirectoryPattern
+		
+		Let vSegmentedQVDs_DoStore_Loop_DirectoryPattern = ;
+		
+	ENDIF 
+	
+	IF (RangeMax(0, $(vSegmentedQVDs_FullLoad)) = 0 and Len('$(vSegmentedQVDs_KeyField)') > 0 and FileSize('$(vSegmentedQVDs_Directory)$(vSegmentedQVDs_DirectoryPath)\$(vSegmentedQVDs_SourceTableName)_$(vSegmentedQVDs_DoStore_PartitionKey).qvd') > 0) THEN 
+		
+		Let vSegmentedQVDs_ExistsParameters = If(Len('$(vSegmentedQVDs_AlernativeExistsField)') > 0, '[$(vSegmentedQVDs_AlernativeExistsField)], [$(vSegmentedQVDs_KeyField)]', '[$(vSegmentedQVDs_KeyField)]');
+		Concatenate([$(vSegmentedQVDs_DoStore_TableName)])
+		LOAD * FROM [$(vSegmentedQVDs_Directory)$(vSegmentedQVDs_DirectoryPath)\$(vSegmentedQVDs_SourceTableName)_$(vSegmentedQVDs_DoStore_PartitionKey).qvd] (qvd)
+			Where not Exists($(vSegmentedQVDs_ExistsParameters));
+	
+	ENDIF
+	
+	If Len('$(vSegmentedQVDs_DropFieldsBeforeStore)') > 0 Then
+		Drop Fields $(vSegmentedQVDs_DropFieldsBeforeStore) FROM [$(vSegmentedQVDs_DoStore_TableName)];
+	End IF
+	
+	STORE [$(vSegmentedQVDs_DoStore_TableName)] into [$(vSegmentedQVDs_Directory)$(vSegmentedQVDs_DirectoryPath)\$(vSegmentedQVDs_SourceTableName)_$(vSegmentedQVDs_DoStore_PartitionKey).qvd] (qvd);
+	
+	DROP TABLE [$(vSegmentedQVDs_DoStore_TableName)];
+	Let vSegmentedQVDs_DirectoryPath = ;
+	
+END SUB 
+
+SUB SegmentedQVDs_AddPrePartitionFields(vSegmentedQVDs_AddPrePartitionFields_TargetTable)
+
+	For vSegmentedQVDs_Loop_PrePartitions = 0 to NoOfRows('SegmentedQVDsPhasedPrePartitions') - 1
+
+		Let vSegmentedQVDs_PrePartitionPeriod_Format = Peek('SegmentedQVDsPhasedPrePartitionPeriod_Format', $(vSegmentedQVDs_Loop_PrePartitions), 'SegmentedQVDsPhasedPrePartitions');
+		
+		Join ([$(vSegmentedQVDs_AddPrePartitionFields_TargetTable)])
+			LOAD Distinct 
+				SegmentedQVDPartitionKey,
+				Text(Date(Date#(SegmentedQVDPartitionKey, '$(vSegmentedQVDs_PartitionFormat)'), '$(vSegmentedQVDs_PrePartitionPeriod_Format)')) as SegmentedQVDPartitionKey_PrePartition_$(vSegmentedQVDs_Loop_PrePartitions)
+			Resident [$(vSegmentedQVDs_AddPrePartitionFields_TargetTable)];
+		
+		Let vSegmentedQVDs_PrePartitionPeriod_Format = ;
+		
+	Next vSegmentedQVDs_Loop_PrePartitions
+
+	Let vSegmentedQVDs_Loop_PrePartitions = ;
+
+	LET vSegmentedQVDs_AddPrePartitionFields_TargetTable =;
+
+END SUB 
